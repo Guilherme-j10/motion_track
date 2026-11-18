@@ -10,7 +10,6 @@ use nokhwa::{
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
-use rayon::prelude::*;
 
 use gpui_kit::*;
 
