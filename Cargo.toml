@@ -1,0 +1,21 @@
+[package]
+name = "motion_track"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+nokhwa = { version = "0.10.11", features = ["input-native", "output-wgpu"]}
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+gpui-kit = "0.10.0"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = "0.7.20"
+image = "0.25"
+
+[profile.dev]
+opt-level = 1            
+
+[profile.dev.package."*"]
+opt-level = 3   
+debug = false
