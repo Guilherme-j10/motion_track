@@ -19,7 +19,7 @@ Rastreamento de landmarks da mão em tempo real, escrito em Rust.
 `motion_track` captura o vídeo da sua webcam, detecta os pontos-chave (*landmarks*) da mão com um modelo de visão computacional e transforma esses movimentos em comandos de mouse: mover o cursor, clicar e arrastar, sem tocar em nada.
 
 > [!NOTE]
-> **Estado atual:** a captura da câmera e a exibição do vídeo em tempo real estão funcionando. O próximo passo é a inferência dos landmarks.
+> **Estado atual:** a captura da câmera e a exibição do vídeo em tempo real estão funcionando. A thread de inferência já recebe os frames da câmera por um canal próprio. O próximo passo é rodar o modelo de landmarks nela.
 
 ## Pipeline
 
@@ -46,8 +46,13 @@ flowchart LR
     subgraph T1[Thread de captura]
         A[Camera::frame] --> B[decode RGBA]
         B --> C[espelhar]
+        C --> R[cópia RGBA]
         C --> D[RGBA → BGRA]
         D --> E["Arc&lt;RenderImage&gt;"]
+    end
+
+    subgraph T3[Thread de inferência]
+        I[recebe o frame mais recente] --> J["modelo (a fazer)"]
     end
 
     subgraph T2[Thread principal · GPUI]
@@ -55,13 +60,16 @@ flowchart LR
         G --> H["img() na tela"]
     end
 
+    R -->|watch| I
     E -->|"watch (só o frame mais recente)"| F
 ```
 
-- **Captura** roda numa `std::thread` dedicada, já que `Camera::frame()` é bloqueante.
+- **Captura** roda numa `std::thread` dedicada, já que `Camera::frame()` é bloqueante. O `Camera` do `nokhwa` não é `Send`, então ele é criado **dentro** da thread. De fora, ela só recebe o `CameraIndex`.
+- **Inferência** roda noutra `std::thread`, porque o modelo vai consumir CPU continuamente. Ela recebe uma cópia RGBA do frame, feita antes da troca para BGRA.
 - **UI** roda na thread principal, como o GPUI exige.
 - **Canal `tokio::sync::watch`** guarda apenas o último frame: se a UI atrasar, ela pula direto para o mais recente, sem acumular fila nem latência.
 - A cada frame novo, a textura do anterior é liberada da GPU com `drop_image`, o que evita vazamento de memória de vídeo.
+- **`CancellationToken`** compartilhado entre as threads: se uma falha, cancela o token para as outras pararem. Para encerrar o app usa-se `cx.quit()`, não `shutdown()`, porque o `shutdown()` só fecha as janelas e deixa o loop de eventos rodando.
 
 ## Checklist
 
@@ -73,10 +81,15 @@ flowchart LR
 - [x] Espelhar o frame na horizontal
 - [x] Converter RGBA → BGRA para o GPUI
 - [ ] Fixar uma resolução leve (ex.: 640×480). Hoje usa `AbsoluteHighestFrameRate`
+- [x] Módulo próprio para a captura (`capture.rs`)
+- [x] Validar o índice da câmera e falhar se nenhuma for encontrada
+- [x] Erros tipados na captura (`GetFrameError` com `thiserror`)
 - [ ] Tratar erros sem `unwrap` (ignorar frames corrompidos, parar só em falhas fatais)
-- [ ] Manter uma cópia em RGB para o modelo
+- [x] Manter uma cópia do frame para o modelo (RGBA, antes da troca para BGRA)
 
 ### 2. 🧠 Inferência
+- [x] Thread dedicada recebendo o frame mais recente (por enquanto só lê o frame)
+- [ ] Esperar o frame novo sem busy-wait (`changed()` em vez de `has_changed()` em loop)
 - [ ] Escolher e baixar os modelos (detector de palma + landmarks, em ONNX)
 - [ ] Integrar o runtime de inferência ([`ort`](https://crates.io/crates/ort))
 - [ ] Pré-processar o frame (resize com letterbox + normalização)
@@ -110,9 +123,11 @@ flowchart LR
 ### ⚙️ Arquitetura
 - [x] Canal `watch` entre a captura e a UI (só o frame mais recente)
 - [x] UI separada em módulo próprio (`ui.rs`)
-- [ ] Canal entre a câmera e a inferência, também descartando frames velhos
-- [ ] Encerramento limpo: parar a captura quando a janela fechar
-- [ ] Separar o restante em módulos (`camera`, `model`, `tracking`, `input`)
+- [x] Canal entre a câmera e a inferência, também descartando frames velhos
+- [x] Módulo de captura separado (`capture.rs`)
+- [ ] Encerramento limpo: cancelar o token quando a janela fechar e fazer `join` nas threads
+- [ ] Fechar a UI (`cx.quit()`) quando uma thread cancelar o token
+- [ ] Separar o restante em módulos (`model`, `tracking`, `input`)
 
 ## Stack
 
@@ -121,10 +136,11 @@ flowchart LR
 | [`nokhwa`](https://crates.io/crates/nokhwa) | Captura da webcam |
 | [`image`](https://crates.io/crates/image) | Buffers de imagem e `Frame` para o `RenderImage` |
 | [`gpui-kit`](https://crates.io/crates/gpui-kit) | Interface gráfica acelerada por GPU |
-| [`tokio`](https://crates.io/crates/tokio) | Canal `watch` entre a captura e a UI |
-| [`tokio-util`](https://crates.io/crates/tokio-util) | `CancellationToken` para parar a captura |
+| [`tokio`](https://crates.io/crates/tokio) | Canais `watch` entre as threads (sem runtime, só `tokio::sync`) |
+| [`tokio-util`](https://crates.io/crates/tokio-util) | `CancellationToken` para parar as threads |
 | [`tracing`](https://crates.io/crates/tracing) | Logs estruturados |
 | [`anyhow`](https://crates.io/crates/anyhow) | Tratamento de erros |
+| [`thiserror`](https://crates.io/crates/thiserror) | Erros tipados da captura (`GetFrameError`) |
 | [`ort`](https://crates.io/crates/ort) *(planejado)* | Inferência dos modelos ONNX |
 | [`enigo`](https://crates.io/crates/enigo) *(planejado)* | Controle do mouse |
 
@@ -149,7 +165,8 @@ cargo run
 ```
 motion_track/
 ├── src/
-│   ├── main.rs      # entrada: thread de captura + inicialização do GPUI
+│   ├── main.rs      # entrada: threads de captura e inferência + inicialização do GPUI
+│   ├── capture.rs   # Capture: lista as câmeras e processa cada frame
 │   └── ui.rs        # MainWindow: recebe os frames e desenha o vídeo
 └── Cargo.toml
 ```

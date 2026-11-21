@@ -12,11 +12,11 @@ pub struct MainWindow {
 
 impl MainWindow {
     pub fn new(device: String, mut receiver: Receiver, cx: &mut Context<Self>) -> Self {
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, app| {
             while receiver.changed().await.is_ok() {
                 let new_frame = receiver.borrow_and_update().clone();
 
-                this.update(cx, |view, cx| {
+                this.update(app, |view, cx| {
                     if let Some(old) = std::mem::replace(&mut view.frame, new_frame) {
                         cx.drop_image(old, None); // libera o frame antigo da GPU
                     }
