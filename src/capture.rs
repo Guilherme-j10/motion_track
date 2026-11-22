@@ -1,13 +1,15 @@
 use anyhow::{anyhow, bail};
 use gpui_kit::RenderImage;
-use image::{Frame, ImageBuffer, Rgba};
+use image::Frame;
 use nokhwa::{
     Camera, NokhwaError,
     pixel_format::RgbAFormat,
-    utils::{ApiBackend, CameraIndex, CameraInfo},
+    utils::{ApiBackend, CameraIndex, CameraInfo, Resolution},
 };
 use thiserror::Error;
 use tokio::sync::watch::Sender;
+
+use crate::utils::LastFrameType;
 
 pub struct Capture {
     pub device_listage: Vec<CameraInfo>,
@@ -20,9 +22,7 @@ pub enum GetFrameError {
     #[error("Capture engine error: {0}")]
     CaptureEngineError(#[from] NokhwaError),
     #[error("Failed to send the rgba frame in channel: {0}")]
-    SendLastFrame(
-        #[from] tokio::sync::watch::error::SendError<Option<ImageBuffer<Rgba<u8>, Vec<u8>>>>,
-    ),
+    SendLastFrame(#[from] tokio::sync::watch::error::SendError<LastFrameType>),
 }
 
 impl Capture {
@@ -55,7 +55,8 @@ impl Capture {
     pub fn process_frame(
         &self,
         camera_instance: &mut Camera,
-        last_frame_sender: &Sender<Option<ImageBuffer<Rgba<u8>, Vec<u8>>>>,
+        last_frame_sender: &Sender<LastFrameType>,
+        cam_resolution: Option<Resolution>,
     ) -> Result<RenderImage, GetFrameError> {
         let frame = camera_instance
             .frame()
@@ -64,7 +65,7 @@ impl Capture {
         let mut image = frame.decode_image::<RgbAFormat>()?;
         image::imageops::flip_horizontal_in_place(&mut image);
 
-        last_frame_sender.send(Some(image.clone()))?;
+        last_frame_sender.send(Some((image.clone(), cam_resolution.clone())))?;
 
         for chunk in image.chunks_exact_mut(4) {
             chunk.swap(0, 2); // convert from rgba to bgra
