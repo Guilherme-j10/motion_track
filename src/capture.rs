@@ -30,7 +30,7 @@ impl Capture {
         let supported_devices = nokhwa::query(ApiBackend::Auto)
             .map_err(|e| anyhow!("Failed to list supported devices: {e}"))?;
 
-        if supported_devices.len() == 0 {
+        if supported_devices.is_empty() {
             bail!("Default camera not found");
         }
 
@@ -44,7 +44,7 @@ impl Capture {
             bail!("Wrong index selected");
         }
 
-        let device = self.device_listage[cam_index as usize].clone();
+        let device = self.device_listage[cam_index].clone();
 
         let device_name = device.human_name();
         let device_index = device.index();
@@ -65,7 +65,7 @@ impl Capture {
         let mut image = frame.decode_image::<RgbAFormat>()?;
         image::imageops::flip_horizontal_in_place(&mut image);
 
-        last_frame_sender.send(Some((image.clone(), cam_resolution.clone())))?;
+        last_frame_sender.send(Some((image.clone(), cam_resolution)))?;
 
         for chunk in image.chunks_exact_mut(4) {
             chunk.swap(0, 2); // convert from rgba to bgra

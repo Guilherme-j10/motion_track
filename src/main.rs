@@ -9,7 +9,7 @@ use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
     utils::{
-        CameraFormat, FrameFormat, RequestedFormat,
+        CameraFormat, CameraIndex, FrameFormat, RequestedFormat,
         RequestedFormatType::{self, AbsoluteHighestFrameRate},
         Resolution,
     },
@@ -33,6 +33,55 @@ mod utils;
 
 const MODEL_RESOLUTION: (u32, u32) = (640, 640);
 
+fn cam_handle(device_index: CameraIndex) -> Result<(Camera, Option<Resolution>), anyhow::Error> {
+    let mut cam_resolution: Option<Resolution> = None;
+    let mut instance = Camera::new(
+        device_index.to_owned(),
+        RequestedFormat::new::<RgbFormat>(AbsoluteHighestFrameRate),
+    )
+    .map_err(|e| anyhow!(e))?;
+
+    let device_resolution = instance.resolution();
+    let target_aspect_ratio = calculate_aspect_ratio_from(
+        (device_resolution.width_x, device_resolution.height_y),
+        MODEL_RESOLUTION.0,
+    );
+
+    let mut formats = instance
+        .compatible_camera_formats()
+        .map_err(|e| anyhow!(e))?;
+
+    formats.sort();
+    formats.dedup();
+
+    let available: Option<CameraFormat> = formats
+        .into_iter()
+        .filter(|f| {
+            let res = f.resolution();
+            res.width_x == target_aspect_ratio.0
+                && res.height_y == target_aspect_ratio.1
+                && f.format() == FrameFormat::NV12
+        })
+        .max_by_key(|f| f.frame_rate());
+
+    let camera = match available {
+        Some(cam_format) => Camera::new(
+            device_index.to_owned(),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(cam_format)),
+        )
+        .map_err(|e| anyhow!(e))?,
+        None => {
+            cam_resolution = Some(Resolution {
+                width_x: target_aspect_ratio.0,
+                height_y: target_aspect_ratio.1,
+            });
+            instance
+        }
+    };
+
+    Ok((camera, cam_resolution))
+}
+
 fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::TRACE)
@@ -50,54 +99,11 @@ fn main() -> anyhow::Result<()> {
     let capture_token = application_token.clone();
 
     std::thread::spawn(move || {
-        let mut cam_resolution: Option<Resolution> = None;
-        let mut camera = match Camera::new(
-            device_index.to_owned(),
-            RequestedFormat::new::<RgbFormat>(AbsoluteHighestFrameRate),
-        ) {
-            Ok(mut instance) => {
-                let device_resolution = instance.resolution();
-                let target_aspect_ratio = calculate_aspect_ratio_from(
-                    (device_resolution.width_x, device_resolution.height_y),
-                    MODEL_RESOLUTION.0,
-                );
-
-                let mut formats = instance
-                    .compatible_camera_formats()
-                    .map_err(|e| format!("Not was possible list camera format: {e}"))
-                    .unwrap();
-
-                formats.sort();
-                formats.dedup();
-
-                let available: Option<CameraFormat> = formats
-                    .into_iter()
-                    .filter(|f| {
-                        let res = f.resolution();
-                        return res.width_x == target_aspect_ratio.0
-                            && res.height_y == target_aspect_ratio.1
-                            && f.format() == FrameFormat::NV12;
-                    })
-                    .max_by_key(|f| f.frame_rate());
-
-                match available {
-                    Some(cam_format) => Camera::new(
-                        device_index.to_owned(),
-                        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(cam_format)),
-                    )
-                    .unwrap(),
-                    None => {
-                        cam_resolution = Some(Resolution {
-                            width_x: target_aspect_ratio.0,
-                            height_y: target_aspect_ratio.1,
-                        });
-                        instance
-                    }
-                }
-            }
+        let (mut camera, cam_resolution) = match cam_handle(device_index) {
+            Ok(cam) => cam,
             Err(e) => {
                 capture_token.cancel();
-                bail!("Failed to get camera instance: {e}");
+                bail!(e)
             }
         };
 
@@ -112,13 +118,11 @@ fn main() -> anyhow::Result<()> {
                         .send(Some(Arc::new(frame)))
                         .expect("Failed to send image to UI");
                 }
-                Err(e) => match e {
-                    _ => {
-                        capture_token.cancel();
-                        error!("{e}");
-                        break Ok(());
-                    }
-                },
+                Err(e) => {
+                    capture_token.cancel();
+                    error!("{e}");
+                    break Ok(());
+                }
             }
         }
     });
@@ -135,41 +139,42 @@ fn main() -> anyhow::Result<()> {
 
             match last_frame_receiver.has_changed() {
                 Ok(status) => {
-                    if status == false {
+                    if !status {
                         continue;
                     }
 
                     let current_frame = last_frame_receiver.borrow_and_update().clone();
 
-                    //                     if saved == false {
-                    //                         if let Some((frame, resolution)) = current_frame {
-                    //                             let t = Instant::now();
-                    //                             let mut buffer_image = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(
-                    //                                 MODEL_RESOLUTION.0,
-                    //                                 MODEL_RESOLUTION.1,
-                    //                                 Rgb([114, 114, 114]),
-                    //                             );
-                    //
-                    //                             let resized_frame = imageops::resize(
-                    //                                 &frame,
-                    //                                 resolution.width_x,
-                    //                                 resolution.height_y,
-                    //                                 FilterType::Triangle,
-                    //                             );
-                    //
-                    //                             let frame_rgb = DynamicImage::ImageRgba8(resized_frame).into_rgb8();
-                    //                             imageops::overlay(
-                    //                                 &mut buffer_image,
-                    //                                 &frame_rgb,
-                    //                                 0,
-                    //                                 (MODEL_RESOLUTION.1 / 2 - (resolution.height_y / 2)) as i64,
-                    //                             );
-                    //
-                    //                             let _ = buffer_image.save("img.png");
-                    //                             println!("The process takes: {:?}", t.elapsed());
-                    //                             saved = true;
-                    //                         }
-                    //                     }
+                    if !saved && let Some((frame, resolution)) = current_frame {
+                        let t = Instant::now();
+                        let mut buffer_image = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(
+                            MODEL_RESOLUTION.0,
+                            MODEL_RESOLUTION.1,
+                            Rgb([114, 114, 114]),
+                        );
+
+                        let mut frame_image = DynamicImage::ImageRgba8(frame).into_rgb8();
+                        if let Some(res) = resolution {
+                            // fast_resize_image crate
+                            frame_image = imageops::resize(
+                                &frame_image,
+                                res.width_x,
+                                res.height_y,
+                                FilterType::Triangle,
+                            );
+                        }
+
+                        imageops::overlay(
+                            &mut buffer_image,
+                            &frame_image,
+                            0,
+                            (MODEL_RESOLUTION.1 / 2 - (frame_image.height() / 2)) as i64,
+                        );
+
+                        println!("The process takes: {:?}", t.elapsed());
+                        let _ = buffer_image.save("img.png");
+                        saved = true;
+                    }
                 }
                 Err(e) => {
                     infer_token.cancel();
@@ -186,12 +191,8 @@ fn main() -> anyhow::Result<()> {
         init(cx);
 
         cx.spawn(async move |app| {
-            while ui_token.is_cancelled() {
-                app.update(|app_ctx| {
-                    app_ctx.quit();
-                });
-                break;
-            }
+            ui_token.cancelled().await;
+            app.update(|app_ctx| app_ctx.quit());
         })
         .detach();
 
