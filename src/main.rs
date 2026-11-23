@@ -1,86 +1,21 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
-use anyhow::{anyhow, bail};
-use image::{
-    DynamicImage, ImageBuffer, Rgb,
-    imageops::{self, FilterType},
-};
-use nokhwa::{
-    Camera,
-    pixel_format::RgbFormat,
-    utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat,
-        RequestedFormatType::{self, AbsoluteHighestFrameRate},
-        Resolution,
-    },
-};
+use anyhow::bail;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, error};
+use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 use gpui_kit::*;
 
 use crate::{
-    capture::Capture,
-    ui::MainWindow,
-    utils::{LastFrameType, calculate_aspect_ratio_from},
+    hardware::camera::Capture, inference::prepare_frame, ui::MainWindow, utils::LastFrameType,
 };
 
-mod capture;
+mod hardware;
+mod inference;
 mod ui;
 mod utils;
-
-const MODEL_RESOLUTION: (u32, u32) = (640, 640);
-
-fn cam_handle(device_index: CameraIndex) -> Result<(Camera, Option<Resolution>), anyhow::Error> {
-    let mut cam_resolution: Option<Resolution> = None;
-    let mut instance = Camera::new(
-        device_index.to_owned(),
-        RequestedFormat::new::<RgbFormat>(AbsoluteHighestFrameRate),
-    )
-    .map_err(|e| anyhow!(e))?;
-
-    let device_resolution = instance.resolution();
-    let target_aspect_ratio = calculate_aspect_ratio_from(
-        (device_resolution.width_x, device_resolution.height_y),
-        MODEL_RESOLUTION.0,
-    );
-
-    let mut formats = instance
-        .compatible_camera_formats()
-        .map_err(|e| anyhow!(e))?;
-
-    formats.sort();
-    formats.dedup();
-
-    let available: Option<CameraFormat> = formats
-        .into_iter()
-        .filter(|f| {
-            let res = f.resolution();
-            res.width_x == target_aspect_ratio.0
-                && res.height_y == target_aspect_ratio.1
-                && f.format() == FrameFormat::NV12
-        })
-        .max_by_key(|f| f.frame_rate());
-
-    let camera = match available {
-        Some(cam_format) => Camera::new(
-            device_index.to_owned(),
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(cam_format)),
-        )
-        .map_err(|e| anyhow!(e))?,
-        None => {
-            cam_resolution = Some(Resolution {
-                width_x: target_aspect_ratio.0,
-                height_y: target_aspect_ratio.1,
-            });
-            instance
-        }
-    };
-
-    Ok((camera, cam_resolution))
-}
 
 fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
@@ -99,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     let capture_token = application_token.clone();
 
     std::thread::spawn(move || {
-        let (mut camera, cam_resolution) = match cam_handle(device_index) {
+        let (mut camera, cam_resolution) = match Capture::camera_handle(device_index) {
             Ok(cam) => cam,
             Err(e) => {
                 capture_token.cancel();
@@ -114,14 +49,14 @@ fn main() -> anyhow::Result<()> {
 
             match capture_instance.process_frame(&mut camera, &last_frame_sender, cam_resolution) {
                 Ok(frame) => {
-                    sender_image
-                        .send(Some(Arc::new(frame)))
-                        .expect("Failed to send image to UI");
+                    if let Err(e) = sender_image.send(Some(Arc::new(frame))) {
+                        capture_token.cancel();
+                        bail!("Error in send last frame to inference layer: {e}");
+                    }
                 }
                 Err(e) => {
                     capture_token.cancel();
-                    error!("{e}");
-                    break Ok(());
+                    bail!("{e}");
                 }
             }
         }
@@ -130,11 +65,9 @@ fn main() -> anyhow::Result<()> {
     let infer_token = application_token.clone();
 
     std::thread::spawn(move || {
-        let mut saved = false;
-
         loop {
             if infer_token.is_cancelled() {
-                break;
+                break Ok(());
             }
 
             match last_frame_receiver.has_changed() {
@@ -143,43 +76,12 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let current_frame = last_frame_receiver.borrow_and_update().clone();
-
-                    if !saved && let Some((frame, resolution)) = current_frame {
-                        let t = Instant::now();
-                        let mut buffer_image = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(
-                            MODEL_RESOLUTION.0,
-                            MODEL_RESOLUTION.1,
-                            Rgb([114, 114, 114]),
-                        );
-
-                        let mut frame_image = DynamicImage::ImageRgba8(frame).into_rgb8();
-                        if let Some(res) = resolution {
-                            // fast_resize_image crate
-                            frame_image = imageops::resize(
-                                &frame_image,
-                                res.width_x,
-                                res.height_y,
-                                FilterType::Triangle,
-                            );
-                        }
-
-                        imageops::overlay(
-                            &mut buffer_image,
-                            &frame_image,
-                            0,
-                            (MODEL_RESOLUTION.1 / 2 - (frame_image.height() / 2)) as i64,
-                        );
-
-                        println!("The process takes: {:?}", t.elapsed());
-                        let _ = buffer_image.save("img.png");
-                        saved = true;
-                    }
+                    let last_frame = last_frame_receiver.borrow_and_update().clone();
+                    let _ = prepare_frame(last_frame);
                 }
                 Err(e) => {
                     infer_token.cancel();
-                    error!("Receiver last frame channel error: {e}");
-                    break;
+                    bail!("Receiver last frame channel error: {e}");
                 }
             }
         }

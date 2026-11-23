@@ -3,13 +3,17 @@ use gpui_kit::RenderImage;
 use image::Frame;
 use nokhwa::{
     Camera, NokhwaError,
-    pixel_format::RgbAFormat,
-    utils::{ApiBackend, CameraIndex, CameraInfo, Resolution},
+    pixel_format::{RgbAFormat, RgbFormat},
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, CameraInfo, FrameFormat, RequestedFormat,
+        RequestedFormatType::{self, AbsoluteHighestFrameRate},
+        Resolution,
+    },
 };
 use thiserror::Error;
 use tokio::sync::watch::Sender;
 
-use crate::utils::LastFrameType;
+use crate::utils::{LastFrameType, MODEL_RESOLUTION, calculate_aspect_ratio_from};
 
 pub struct Capture {
     pub device_listage: Vec<CameraInfo>,
@@ -75,5 +79,56 @@ impl Capture {
         let render = RenderImage::new(vec![to_frame]);
 
         Ok(render)
+    }
+
+    pub fn camera_handle(
+        device_index: CameraIndex,
+    ) -> Result<(Camera, Option<Resolution>), anyhow::Error> {
+        let mut cam_resolution: Option<Resolution> = None;
+        let mut instance = Camera::new(
+            device_index.to_owned(),
+            RequestedFormat::new::<RgbFormat>(AbsoluteHighestFrameRate),
+        )
+        .map_err(|e| anyhow!(e))?;
+
+        let device_resolution = instance.resolution();
+        let target_aspect_ratio = calculate_aspect_ratio_from(
+            (device_resolution.width_x, device_resolution.height_y),
+            MODEL_RESOLUTION.0,
+        );
+
+        let mut formats = instance
+            .compatible_camera_formats()
+            .map_err(|e| anyhow!(e))?;
+
+        formats.sort();
+        formats.dedup();
+
+        let available: Option<CameraFormat> = formats
+            .into_iter()
+            .filter(|f| {
+                let res = f.resolution();
+                res.width_x == target_aspect_ratio.0
+                    && res.height_y == target_aspect_ratio.1
+                    && f.format() == FrameFormat::NV12
+            })
+            .max_by_key(|f| f.frame_rate());
+
+        let camera = match available {
+            Some(cam_format) => Camera::new(
+                device_index.to_owned(),
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(cam_format)),
+            )
+            .map_err(|e| anyhow!(e))?,
+            None => {
+                cam_resolution = Some(Resolution {
+                    width_x: target_aspect_ratio.0,
+                    height_y: target_aspect_ratio.1,
+                });
+                instance
+            }
+        };
+
+        Ok((camera, cam_resolution))
     }
 }
