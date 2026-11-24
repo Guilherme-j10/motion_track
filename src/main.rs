@@ -3,13 +3,13 @@ use std::sync::Arc;
 use anyhow::bail;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::Level;
+use tracing::{Level, error};
 use tracing_subscriber::FmtSubscriber;
 
 use gpui_kit::*;
 
 use crate::{
-    hardware::camera::Capture, inference::prepare_frame, ui::MainWindow, utils::LastFrameType,
+    hardware::camera::Capture, inference::image::InferLayer, ui::MainWindow, utils::LastFrameType,
 };
 
 mod hardware;
@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     let (device_name, device_index) = capture_instance.set_camera(0)?;
 
     let (sender_image, receiver_image) = watch::channel::<Option<Arc<RenderImage>>>(None);
-    let (last_frame_sender, mut last_frame_receiver) = watch::channel::<LastFrameType>(None);
+    let (last_frame_sender, last_frame_receiver) = watch::channel::<LastFrameType>(None);
 
     let capture_token = application_token.clone();
 
@@ -64,28 +64,14 @@ fn main() -> anyhow::Result<()> {
 
     let infer_token = application_token.clone();
 
-    std::thread::spawn(move || {
-        loop {
-            if infer_token.is_cancelled() {
-                break Ok(());
+    std::thread::spawn(
+        move || match InferLayer::new(infer_token, last_frame_receiver) {
+            Ok(mut infer) => {
+                let _ = infer.run_engine();
             }
-
-            match last_frame_receiver.has_changed() {
-                Ok(status) => {
-                    if !status {
-                        continue;
-                    }
-
-                    let last_frame = last_frame_receiver.borrow_and_update().clone();
-                    let _ = prepare_frame(last_frame);
-                }
-                Err(e) => {
-                    infer_token.cancel();
-                    bail!("Receiver last frame channel error: {e}");
-                }
-            }
-        }
-    });
+            Err(e) => error!("{e}"),
+        },
+    );
 
     let ui_token = application_token.clone();
 
